@@ -1,0 +1,296 @@
+---
+title: "Untitled"
+output: github_document
+editor: Beau van Koert
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages 
+```{r package import, include = FALSE}
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(feather)
+library(ggplot2)
+# library(httpgd)
+library(broom)
+```
+
+# Prepare SR data 
+```{r}
+# ON PC
+# Set working directory 
+# sr_path <- "C:/Users/6569757/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/SR Data Polygon"
+
+# ON LAPTOP
+# Set working directory 
+# sr_path <- "G:/My Drive/LC02_Polygon_Pull_COMID"
+sr_path <- "C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/SR Data Polygon"
+
+# Import the raw polygon SR .csv-files
+sr_raw <- list.files(path=sr_path, pattern=".csv", full.names = T) %>%
+  map_df(~ fread(., stringsAsFactors = F))
+
+sr <- sr_raw %>%
+ # filter(!is.na(Blue)) %>% # Drop all of rows that have been masked but still have lines due to metadata extraction 
+  mutate(date = date / 1000) # Have to convert miliseconds to seconds for following line 
+
+# Convert miliseconds since epoch to date
+sr$datetime <- as.POSIXct(sr$date, origin = "1970-01-01", tz = 'UTC')
+sr$date <- as.POSIXct(sr$date, origin = "1970-01-01", tz = 'UTC')
+sr$date <- as_date(sr$date)
+```
+
+# Clean SR data 
+```{r create cleaned-up sr-data, include = FALSE} 
+# Filter on correct variable ranges
+sr_clean <- sr %>% 
+    filter(pCount_dswe1 > 5, 
+    # hillShadow > 0, 
+    Blue <= 1, 
+    Blue >= -0.1999725,
+    Green <= 1, 
+    Green >= -0.1999725, 
+    Red <= 1, 
+    Red >= -0.1999725,
+    Swir1 <= 1, 
+    Swir1 >= -0.1999725,
+    Swir2 <= 1, 
+    Swir2 >= -0.1999725) %>% 
+    rename(index = "system:index") %>%
+    # Replace the 'index' with only the Landsat generation indicator
+    mutate(LT05 = str_extract(index, pattern = c('LT05')),
+           LE07 = str_extract(index, pattern = c('LE07')),
+           LC08 = str_extract(index, pattern = c('LC08')),
+           LC09 = str_extract(index, pattern = c('LC09')),
+           sat = coalesce(LT05, LE07, LC08, LC09)) %>%
+    select(-LT05, -LE07, -LC08, -LC09)   %>% 
+    mutate(month = as.numeric(month(date)),
+      year = year(date),
+      hour = hour(datetime)) %>%
+    # Extract seasonal data and create new 'season' column
+    mutate(season = case_when(
+      month %in%  9:11 ~ "Fall",
+      month %in%  c(12,1,2)  ~ "Winter",
+      month %in%  3:5  ~ "Spring",
+      TRUE ~ "Summer")) %>%
+    # Add (half) decade blocks in new 'decade' column
+    mutate(decade= cut(year, breaks = c(1983,1990,1995,2000,2005,2010,2015,2020),
+                       labels = c(1990,1995,2000,2005,2010,2015,2020) )) %>%
+    # Rename 'index' (e.g. LC09) to 'landsatID'
+    rename(landsatID = 'index') %>% 
+    ungroup()
+```
+
+# Apply correction coefficients
+```{r}
+# ON PC
+# corr_coef <- read_feather("C:/Users/samsi/OneDrive - University of Pittsburgh/SR_Band_Correction.feather") %>%
+# corr_coef <- read_feather("C:/Users/6569757/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/LC02_Corr_Coef.feather") %>%
+#   ungroup()
+
+# ON LAPTOP
+corr_coef <- read_feather("C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/LC02_Corr_Coef.feather") %>%
+  ungroup()
+
+# Remove the column 'fit'
+correction_coef_99 <- corr_coef %>%
+  filter(fit %in% c(NA, "98_quant")) %>%
+  dplyr::select(-fit)
+
+
+sr_clean <- sr_clean %>%
+  mutate(rn = row_number()) %>%
+  mutate(sat = as.character(sat)) %>%
+  gather(Red ,Green, Blue, Nir, Swir1, Swir2, key='band', value='value') %>%
+  # Group the data of the optical bands to per band and also per landsat version
+  group_by(band, sat) %>%
+  # Add the bands 
+  left_join(correction_coef_99, by=c("band", "sat")) %>%
+  mutate(value_cor =  coef2*value^ 2 + coef1*value + intercept) %>%
+  ungroup() %>%
+  # If the corrected value is lower than/equal to 0, use uncorrected value
+  mutate(value_cor = ifelse(value_cor <=0, value, value_cor)) %>%
+  dplyr::select(-intercept, -coef1, -coef2) %>%
+  pivot_wider(names_from = band,
+              values_from = c("value", "value_cor"))  %>%
+    # For the corrected values, rename the column names to just the band name
+    rename_at(vars(starts_with("value_")),
+           function(x) stringr::str_replace_all(x, "value_", "")) %>%
+    # For the raw uncorrected values, rename the column names to "bandname + _raw"
+    rename_at(vars(Red, Green, Blue, Nir, Swir1, Swir2),function(x) paste0(x,"_raw")) %>%
+    rename_at(vars(starts_with("cor")),            funs(stringr::str_replace_all(., "cor_", ""))) 
+
+```
+
+
+# Add band ratios, color metrics 
+```{r}
+chroma <- function(R, G, B) {
+  require(colorscience)
+  require(tidyverse)
+# Converst R,G, and B spectral reflectance to dominant wavelength based
+# on CIE chromaticity color space
+
+# see Wang et al 2015. MODIS-Based Radiometric Color Extraction and
+# Classification of Inland Water With the Forel-Ule
+# Scale: A Case Study of Lake Taihu
+
+# chromaticity.diagram.color.fill()
+Xi <- 2.7689*R + 1.7517*G + 1.1302*B
+Yi <- 1.0000*R + 4.5907*G + 0.0601*B
+Zi <- 0.0565*G + 5.5943*B
+
+x <-  Xi / (Xi + Yi +  Zi)
+y <-  Yi / (Xi + Yi +  Zi)
+z <-  Zi / (Xi + Yi +  Zi)
+
+# calculate hue angle
+alpha <- atan2( (x - (1/3)), (y - (1/3))) * 180/pi
+
+# make look up table for hue angle to wavelength conversion
+cie <- cccie31 %>%
+  dplyr::mutate(a = atan2( (x - (1/3)), (y - (1/3))) * 180/pi) %>%
+  dplyr::filter(wlnm <= 700) %>%
+  dplyr::filter(wlnm >=380) 
+
+# find nearest dominant wavelength to hue angle
+wl <- cie[as.vector(sapply(alpha,function(x) which.min(abs(x - cie$a)))), 'wlnm']
+
+return(wl)
+}
+
+
+pull_transform <- function(df, maxRGB=1, RGB=F) {
+  
+  if(RGB == T) { 
+    
+    maxRGB <- maxRGB
+    
+    data <- df %>%
+      filter_at(vars(Red, Green, Blue), all_vars(.< maxRGB))
+    
+  }else{ 
+    
+    data <- df
+
+    maxRGB <- df  %>%
+      dplyr::select(Red, Green, Blue) %>%
+      dplyr::summarise(maxRGB = max(., na.rm=F)) 
+    
+    maxRGB <- maxRGB$maxRGB
+  }
+  
+  data <- data %>%
+    dplyr::mutate(NR = Nir/Red,
+                  BR = Blue/Red,
+                  GR = Green/Red,
+                  SR = Swir1/Red,
+                  BG = Blue/Green,
+                  RG = Red/Green, 
+                  NG = Nir/Green,
+                  SG = Swir1/Green,
+                  BN = Blue/Nir,
+                  GN = Green/Nir,
+                  RN = Red/Nir,
+                  SN = Swir1/Nir,
+                  BS = Blue/Swir1,
+                  GS = Green/Swir1,
+                  RS = Red/Swir1,
+                  NS = Nir/Swir1,
+                  R_GN = Red/ (Green + Nir),
+                  R_GB = Red/ (Green + Blue),
+                  R_GS = Red/ (Green + Swir1),
+                  R_BN = Red/ (Blue + Nir),
+                  R_BS = Red/ (Blue + Swir1),
+                  R_NS = Red/ (Nir + Swir1),
+                  G_BR = Green/ (Blue + Red),
+                  G_BN = Green / (Blue + Nir),
+                  G_BS = Green / (Blue + Swir1),
+                  G_RN = Green / (Red + Nir),
+                  G_RB = Green / (Red + Blue),
+                  G_NS = Green / (Nir + Swir1),
+                  B_RG = Blue / (Red + Green),
+                  B_RN = Blue / (Red + Nir),
+                  B_RS = Blue / (Red + Swir1),
+                  B_GN = Blue / (Green + Nir),
+                  B_GS = Blue / (Green + Swir1),
+                  B_NS = Blue / (Nir + Swir1),
+                  N_RG = Nir / (Red + Green),
+                  N_RB = Nir / (Red + Blue),
+                  N_RS = Nir / (Red + Swir1),
+                  N_GB = Nir / (Green + Blue),
+                  N_GS = Nir / (Green + Swir1),
+                  N_BS = Nir / (Blue  + Swir1),
+                  GR2 = (Green + Red) / 2,
+                  GN2 = (Green + Nir) / 2,
+                  #Adding bloom metrics 
+                  BR_G = (Blue - Red) / Green,
+                  NS_NR = (Nir - Swir1) / (Red - Swir1),
+                  fai = Nir - (Red + (Swir1-Red)*((830-660)/(1650-660))),
+                  GCI = Nir/(Green-1),
+                  IRG = Red-Green,
+                  SABI = (Nir-Red)/(Blue + Green),
+                  KIVU = (Blue-Red)/Green,
+                  GB = Green/Blue,
+                  GNDVI = (Nir-Green)/(Nir+Green),
+                  EVI = 2.5*((Nir-Red)/(Nir+((6*Red)-(7.5*Blue))+1)),
+                  # KAB = 1.67-3.94*log(Blue)+3.78*log(Red),
+                  KRL = (((Blue/Red)*Nir)-98)/0.75,
+                  N_S = Nir - Swir1,
+                  N_R = Nir - Red,
+                  ndvi = ((Nir-Red)/(Nir+Red)),
+                  ndwi = ((Green- Swir1)/(Green + Swir1)),
+                  ndssi = ((Blue - Nir)/ (Blue + Nir)),
+                  gn_gn= ((Green- Nir)/ (Green + Nir)),
+                  # Add ndti (Normalized Difference Turbidity Index)
+                  ndti = (Red - Green) / (Red + Green)
+                  )
+
+  # Get color metrics
+  color <- data %>% filter(Blue > 0 & Green > 0 & Red > 0) %>% 
+    dplyr:: mutate(hue = rgb2hsv(r=Red, g=Green, b=Blue, maxColorValue = maxRGB)[1,],
+            saturation = rgb2hsv(r=Red, g=Green,  b=Blue, maxColorValue = maxRGB)[2,],
+            bright = rgb2hsv(r=Red, g=Green,  b=Blue, maxColorValue = maxRGB)[3,],
+            bright_tot = (Red + Green + Nir +Blue),
+            dw = chroma(R=Red, G=Green, B=Blue),
+            hexcolor = rgb(r=Red, g=Green, b=Blue, maxColorValue = maxRGB))
+
+  color_na <- data %>% filter(!rn %in% color$rn) %>% 
+    dplyr:: mutate(hue = 'NA',
+            saturation = 'NA',
+            bright = 'NA',
+            bright_tot = 'NA',
+            dw = 'NA', 
+            hexcolor = 'NA')
+
+  data <-rbind(color, color_na) 
+
+  return(data)
+}
+
+LC02_Polygons <- pull_transform(sr_clean, RGB=F, maxRGB=1) 
+
+LC02_Polygons$dw <-  as.numeric(LC02_Polygons$dw)
+
+LC02_Polygons$saturation = as.numeric(LC02_Polygons$saturation)
+
+LC02_Polygons$hue <- as.numeric(LC02_Polygons$hue)
+```
+
+# Save files to drive
+``` {r Save files by writing to drive}
+
+# Save LC02_Polygons as feather
+# ON PC
+# write_feather(LC02_Polygons, "C:/Users/6569757/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/Data/LC02_Polygons_Reach_ID.feather")
+
+# ON LAPTOP
+# write_feather(LC02_Polygons, "C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/Model_Data/LC02_Polygons_Reach_ID.feather")
+write.csv(LC02_Polygons, "C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/Model_Data/LC02_Polygons_Reach_ID.csv", row.names = FALSE)
+
+```
+
