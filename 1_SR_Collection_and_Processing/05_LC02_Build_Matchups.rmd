@@ -111,7 +111,7 @@ sr_clean <- sr %>%
 ```
 
 #Add date buffer (2-days-buffer)
-```{r add date buffer, include = FALSE}
+```{r add date buffer, eval=FALSE, include=FALSE}
 # Now I will create additional environment variables with date fields that have been added to , in order to join via +- 1 day, +- 2 day. So, there will be a variable with date + 1 , date - 1, etc
 date0 <- sr %>%
  mutate(date = ymd(date))
@@ -228,7 +228,7 @@ sr_final <- sr_final %>%
 ```
 
 #Add date buffer (0-day-buffer)
-```{r add date buffer, include = FALSE}
+```{r add date buffer, eval=FALSE, include=FALSE}
 # Now I will create additional environment variables with date fields that have been added to , in order to join via +- 1 day, +- 2 day. So, there will be a variable with date + 1 , date - 1, etc
 date0 <- sr %>%
  mutate(date = ymd(date))
