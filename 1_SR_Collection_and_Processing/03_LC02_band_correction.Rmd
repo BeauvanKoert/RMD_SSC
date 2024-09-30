@@ -1,0 +1,472 @@
+---
+title: "Optical Band Corrections"
+author: "Sam Sillen"
+date: "2022-03-10"
+editor: "Beau van Koert"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+
+```{r script info, include = FALSE}
+# This file uses all the available SR data over wqp/lagos sites (not just in-situ matchups) to create correlation coefficients between different landsat sensors. 
+
+# These coefficients will be applied to 1) the matchup dataset; and 2) the River SR dataset during later steps in the model.
+
+```
+
+# Packages
+
+```{r packages, include = FALSE}
+
+# update "scales" package to version 1.3.0 with "install.packages("scales", type = "source")
+# then install "ggplot2"  for making plots
+# and install "magrittr"  
+# and install "ggpubr"    for publication-ready plot production
+library(versions)
+library(ggplot2)
+library(tidyverse)
+library(magrittr)
+library(dplyr)
+library(ggpubr)
+library(lubridate)
+library(data.table)
+library(broom)
+library(feather)
+```
+
+# Prepare SR data for joining with in situ
+
+```{r import raw data, include=FALSE}
+# # Set working directory (DESKTOP)
+sr_path <- "C:/Users/6569757/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/SR Data Polygon"
+# Set working directory (LAPTOP)
+# sr_path <- "C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/SR Data Polygon"
+
+
+# Import all .csv-files from the working directory and merge them to one large data frame
+sr_raw <- list.files(path=sr_path, pattern=".csv", full.names = TRUE) %>%
+  # map_df(~ read_csv(., col_types = cols(.default = "c")))
+  map_df(~ read.csv(., stringsAsFactors = FALSE, na.strings = "", blank.lines.skip = TRUE))      # added by beau
+  # map_df(~ fread(., stringsAsFactors = FALSE, fill = TRUE))           # original
+#           filter(.[[1]] >= 0))                                        # added as test by Beau
+
+sr <- sr_raw %>%
+ # drop_na(Blue) %>% # Drop all of rows that have been masked but still have lines due to metadata extraction , actually not necessary anymore since pull updates
+  mutate(date = date / 1000, # Have to convert miliseconds to seconds for following line 
+         datetime =  as.POSIXct(date, origin = "1970-01-01", tz = 'UTC'),
+         date = as.POSIXct(date, origin = "1970-01-01", tz = 'UTC'),
+         date = as_date(date))
+
+```
+
+```{r prepare clean SR data, include=FALSE}
+
+#Start to build SR file 
+sr_clean <- sr %>% 
+    # Filter on useful measurements based on their values
+    filter(pCount_dswe1 > 5, 
+    # hillShadow > 0, 
+    Blue <= 1, 
+    Blue >= 0,
+    Green <= 1, 
+    Green >=  0, 
+    Red <= 1, 
+    Red >=  0,
+    Swir1 <= 1, 
+    Swir1 >=  0,
+    Swir2 <= 1, 
+    Swir2 >=  0, 
+    Nir >=  0, 
+    Nir <= 1) %>% 
+    
+    # rename(index = "system:index") %>%
+    rename(index = "system.index") %>%
+    
+    # Extract landsat version from index and create new columns
+    mutate(LT05 = str_extract(index, pattern = c('LT05')),
+           LE07 = str_extract(index, pattern = c('LE07')),
+           LC08 = str_extract(index, pattern = c('LC08')),
+           LC09 = str_extract(index, pattern = c('LC09')),
+           sat = coalesce(LT05, LE07, LC08, LC09)) %>%
+    # Continue working with data that can be assigned to a Landsat version
+    select(-LT05, -LE07, -LC08, -LC09)   %>% 
+    
+    # Add columns for month, year, and hour
+    mutate(month = as.numeric(month(date)),
+      year = year(date),
+      hour = hour(datetime)) %>%
+    
+    # Add a column "season"
+    mutate(season = case_when(
+      month %in%  9:11 ~ "Fall",
+      month %in%  c(12,1,2)  ~ "Winter",
+      month %in%  3:5  ~ "Spring",
+      TRUE ~ "Summer")) %>%
+    
+    # Add column "decade" 
+    mutate(decade = cut(year, breaks = c(1983,1990,1995,2000,2005,2010,2015,2020,2023),
+                       labels = c(1990,1995,2000,2005,2010,2015,2020,2023) )) %>%
+    
+    # Rename the column "index" again to "landsatID"
+    rename(landsatID = 'index')  %>% 
+    
+    # # Group the column SiteID by unique values         Not done as by suggestion of Punwath
+    # dplyr::group_by(SiteID) %>%
+  
+    # Group the column Reach_ID by unique values
+    dplyr::group_by(Reach_ID) %>%
+
+    # For every Reach_ID-group, calculate the nr of measurements, the first and least year of measuring, and the number     of measurement years, and create new columns for these variables
+    dplyr::mutate(count =n(),
+                  max_year = max(year, na.rm = T),
+                  min_year = min(year, na.rm = T),
+                  n_years = (max_year - min_year)) %>%
+    # Assign the group-variable values to each member of the group, and ungroup the table
+    ungroup()
+
+```
+
+# Coefficients for LS 5
+
+```{r filter on LS5-SR and LS7-SR, include = FALSE}
+sr_57 <- sr_clean %>%
+  filter(sat %in% c("LE07", "LT05")) %>%
+  
+  # Also filter on LS5 and LS7 date range (just to be sure)
+  filter(between(date, "1999-01-01", "2012-05-01" )) %>%
+  
+  # filter to site with enough data (10+ years)
+  filter(n_years > 10) %>%
+  
+  # # Select veriables of interest for correlation                    Not used as by suggestion of Punwath
+  # select(SiteID, date, sat, count, n_years, Blue, Red, Green, Nir, Swir1, Swir2) %>%
+  
+  # Select veriables of interest for correlation
+  select(Reach_ID, date, sat, count, n_years, Blue, Red, Green, Nir, Swir1, Swir2) %>%
+  
+  # Stack all bands in the 'band'-column (wide df -> tall df)
+  gather(Blue:Swir2, Green, key='band', value='value') 
+
+```
+
+```{r calculate LS5 and LS7 band percentiles, include = FALSE}
+sr_57_rank  <- sr_57 %>%
+  # Discard columns in the new df that were excluded in above filters (sr_57)
+  droplevels() %>%
+  
+  # Filter on LS5
+  filter(sat =="LT05") %>%
+  
+  # Group by band (eg 'Blue' or 'Swir1')
+  group_by(band) %>%
+  
+  # Nest all data inside the band-tibbles
+  nest() %>%
+  
+  # Calculate 100-quantiles (also percentiles) within each band-group, values 0-1 with 0.01 steps.
+  mutate( ret = purrr::map(data, ~quantile(.$value, probs = seq(0,1,0.01))),
+          ret = purrr::invoke_map(tibble, ret)) %>%
+  
+  # Unnest the quantile results (to place them into separate rows)
+  unnest(ret) %>%
+  
+  # ??????
+  dplyr::select(-data) %>%
+  
+  # Stack all quantiles to form 101 rows (101 percentiles) per band-group
+  pivot_longer(
+    cols= contains("%")
+  ) %>%
+  
+  # Create a new column 'quant' with quantiles as decimal number
+  mutate(quant = parse_number(name)/100) %>%
+  
+  # Rename the 'value'-column to 'value-5' for LS5
+  rename(value_5 = value) %>%
+  
+  # Calculate the 100-quantiles/percentiles per band again for Landsat 7, and join this column to the df
+  inner_join(sr_57 %>%
+               droplevels() %>%
+               filter(sat =="LE07") %>%
+               group_by(band) %>%
+               nest() %>%
+               mutate( ret = purrr::map(data, ~quantile(.$value, probs = seq(0,1,0.01))),
+                       ret = purrr::invoke_map(tibble, ret)) %>%
+               unnest(ret) %>%
+               dplyr::select(-data) %>%
+               pivot_longer(
+                 cols= contains("%")
+               ) %>%
+               mutate(quant = parse_number(name)/100) %>%
+               # Create new column with percentile values for Landsat 7
+               rename(value_7 = value) %>%
+               # Select this dataframe for the next operation (see next chunk as 'df')
+               dplyr::select(-name),
+             # Say which columns to select for next operation
+             by=c("band", "quant")) 
+```
+
+```{r polynomial regression for coeff_5 calculation, include = FALSE}
+
+# Fit a polynomial regression model, where it models the dependent variable 'value_7' as a 
+# 2nd degree polynomial function of the variable 'value_5'
+poly_5_trunc <- function(df){
+  lm(value_7 ~ poly(value_5, 2, raw=T), data = df %>%
+       # Filter on the data to use for the model: remove the 0th and 100th quantile, so its a 98th-quant fit
+       filter(!quant %in% c(0, 1))  )
+}
+# Now fit a second order polynomial model through the data and use all data, instead of only 98-quantiles
+poly_5_all <- function(df){
+  lm(value_7 ~ poly(value_5, 2, raw=T), data = df)
+}
+
+## polynomial correction fit
+poly_57 <- sr_57_rank %>%
+  ungroup() %>%
+#  filter(band != "dw") %>%
+  nest(-band) %>%
+  # Apply the polynomial fit (98-quant or "truncated") to the data
+  mutate( model = purrr::map(data, poly_5_trunc)) %>%
+  
+  # Apply the polynomial fit (100-quant or "all") to the data
+  mutate( model_all = purrr::map(data, poly_5_all)) %>%
+  
+  # Predict values for LS5 using the 98-quant 2nd order polynomial fit
+  mutate( pred = purrr::map2(model, data, predict)) %>%
+  
+  # Predict values for LS5 using the 100-quant 2nd order polynomial fit
+  mutate( pred_all = purrr::map2(model_all, data, predict)) %>%
+  unnest(c(pred, pred_all, data))  %>%
+  dplyr::select(-model, -model_all)
+
+# Calculate the correction coefficients for each band and present them in a easy-to-read table
+coef_5 <- sr_57_rank %>%
+  ungroup() %>%
+#  filter(band != "dw") %>%
+  # Filter again on the 98-quant
+  filter(!quant %in% c(0, 1)) %>%
+  
+  # Group the data by bands (here 6)
+  group_by(band)  %>%
+  
+  # Nest all data inside the band-tibbles
+  nest() %>%
+  
+  # For this band-grouped data fit the polynomial regression and 
+  mutate( model = purrr::map(data, ~lm(value_7 ~ poly(value_5, 2, raw=T), data = .) %>%
+                               tidy %>%
+                               # Extract the correction coefficients from the fitted polynomial function
+                               dplyr::select(term, estimate) %>%
+                               # The corr coeff per band are still in one column (called 'term'), so we want to spread                                them out over multiple columns and make the dataframe wider.
+                               spread(term, estimate))) %>%
+  unnest(model) %>%
+  dplyr::select(-data) %>%
+  
+  # Rename the columns in the dataframe
+  rename(band= 1, intercept=2, coef1=3, coef2=4 )  %>%
+  
+  # Add a column called 'sat', with the string-value "LT05"
+  mutate(sat = "LT05") %>%
+  
+  # Add a column called 'fit', with the string-value "98_quant"
+  mutate(fit = "98_quant")
+```
+
+```{r plot LS5 vs LS7, include = FALSE}
+
+# Create a plot where value_7 (Y-axis) is plotted against value_5 (X-axis)
+plot_57 <- ggplot(poly_57) + 
+geom_point( aes(x = value_5, y = value_7))+
+#geom_point(aes(x=pred_all, y=value_7), color = 'red', alpha =0.5)+
+
+# Add the predicted LS7 SR-values as semitransparent points
+geom_point(aes(x=pred, y = value_7), color = 'red', alpha =0.5)+
+
+# Add a 1:1-line through the plot
+geom_abline(aes(slope = 1, intercept =0))+
+
+# Set the limits for the axes
+xlim(0,0.5) + 
+ylim(0,0.5) + 
+facet_wrap(~band, scales = "free")+
+  # Set axis labels
+  labs(x = 'Landsat 5', y = 'Landsat 7') + 
+  # Set black and white theme (white background, grey gridlines)
+  theme_bw() + 
+  # Further customize margins, text color, text size, axis titles, and plot title
+  theme(plot.margin = margin(11, 11, 11, 11), axis.text = element_text(colour = 'black', size = 16),strip.text = element_text(size=20), axis.title = element_text(size = 24, colour = 'black'),plot.title = element_text(size = 30, colour = 'black'))
+
+```
+
+# Coefficients for LS 8 (and 9)
+
+```{r filter on LS8-SR and LS7-SR, include = FALSE}
+sr_78 <- sr_clean %>%
+  filter(sat %in% c("LE07", "LC08")) %>%
+  
+  # Also filter on LS5 and LS7 date range (just to be sure)
+  filter(date > "2013-04-11" ) %>%
+  
+  # Filter to site with enough data (10+ years)
+  filter(n_years > 10) %>%
+  
+  # Select veriables of interest for correlation
+  # select(SiteID, date, sat, count, n_years, Blue, Red, Green, Nir, Swir1, Swir2) %>%
+  select(Reach_ID, date, sat, count, n_years, Blue, Red, Green, Nir, Swir1, Swir2) %>%
+  
+  # Stack all bands in the 'band'-column (wide df -> tall df)
+  gather(Blue:Swir2, key='band', value='value')  
+```
+
+```{r calculate LS8 and LS7 band percentiles, include = FALSE}
+# do ranking plotting percentiles, joining, and correcting
+sr_78_rank  <- sr_78 %>%
+  # Discard columns in the new df that were excluded in above filters (sr_87)
+  droplevels() %>%
+  
+  # Filter on LS5
+  filter(sat =="LC08") %>%
+  
+  # Group by band (eg 'Blue' or 'Swir1')
+  group_by(band) %>%
+  
+  # Nest all data inside the band-tibbles
+  nest() %>%
+  
+  # Calculate 100-quantiles (also percentiles) within each band-group, values 0-1 with 0.01 steps.
+  mutate( ret = purrr::map(data, ~quantile(.$value, probs = seq(0,1,0.01))),
+          ret = purrr::invoke_map(tibble, ret)) %>%
+  
+  # Unnest the quantile results (to place them into separate rows)
+  unnest(ret) %>%
+  
+  # ?????
+  dplyr::select(-data) %>%
+  
+  # Stack all quantiles to form 101 rows (101 percentiles) per band-group
+  pivot_longer(
+    cols= contains("%")
+  ) %>%
+  
+  # Create a new column 'quant' with quantiles as decimal number
+  mutate(quant = parse_number(name)/100) %>%
+  
+  # Rename the 'value'-column to 'value-8' for LS8
+  rename(value_8 = value) %>%
+  
+  # Calculate the 100-quantiles/percentiles per band again for Landsat 7, and join this column to the df
+  inner_join(sr_78 %>%
+               droplevels() %>%
+               filter(sat =="LE07") %>%
+               group_by(band) %>%
+               nest() %>%
+               mutate( ret = purrr::map(data, ~quantile(.$value, probs = seq(0,1,0.01))),
+                       ret = purrr::invoke_map(tibble, ret)) %>%
+               unnest(ret) %>%
+               dplyr::select(-data) %>%
+               pivot_longer(
+                 cols= contains("%")
+               ) %>%
+               mutate(quant = parse_number(name)/100) %>%
+               rename(value_7 = value) %>%
+               dplyr::select(-name),
+             by=c("band", "quant"))  
+```
+
+```{r polynomial regression for coeff_8 calculation, include = FALSE}
+poly_8_trunc <- function(df){
+  lm(value_7 ~ poly(value_8, 2), data = df %>%
+       filter(!quant %in% c(0, 1))  )
+}
+poly_8_all <- function(df){
+  lm(value_7 ~ poly(value_8, 2), data = df)
+}
+
+poly_78 <- sr_78_rank %>%
+  ungroup() %>%
+#  filter(band != "dw") %>%
+  nest(-band) %>%
+  mutate( model = purrr::map(data, poly_8_trunc)) %>%
+  mutate( model_all = purrr::map(data, poly_8_all)) %>%
+  mutate( pred = purrr::map2(model, data, predict)) %>%
+  mutate( pred_all = purrr::map2(model_all, data, predict)) %>%
+  unnest(c(pred, pred_all, data)) %>%
+  dplyr::select(-model, -model_all)
+```
+
+```{r plot LS8 vs LS7 and save all plots, include = FALSE}
+plot_78 <- ggplot(poly_78) +
+  geom_point( aes(x=value_8, y= value_7))+
+ # geom_point( aes(x=pred_all, y= value_7), color="red", alpha=0.5)+
+  geom_point( aes(x=pred, y= value_7), color="red", alpha=0.5)+
+  geom_abline(aes(slope=1, intercept=0)) +
+  facet_wrap(~band, scales="free") + 
+xlim(0, 0.5) +
+ylim(0, 0.5) +
+  labs(x = 'Landsat 8', y = 'Landsat 7') + 
+  theme_bw() + 
+  theme(plot.margin = margin(11, 11, 11, 11), axis.text = element_text(colour = 'black', size = 16),strip.text = element_text(size=20), axis.title = element_text(size = 24, colour = 'black'),plot.title = element_text(size = 30, colour = 'black'))
+
+# Combine plots, placing the plots for LS8 vs LS7 below the plots for LS5 vs LS7
+combined_corr <- ggarrange(plot_57, plot_78, nrow = 2)
+
+# Print the plots in-line
+combined_corr
+
+# # Save the plots as .jpeg-file to drive (DESKTOP)
+# ggsave("C:/Users/6569757/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/Plots/SR_band_correction.jpeg", width = 11.5, height = 10, unit = 'in')
+
+# Save the plots as .jpeg-file to drive (LAPTOP)
+ggsave("C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/Plots/SR_band_correction.jpeg", width = 11.5, height = 10, unit = 'in')
+
+
+```
+
+```{r coeff_8 calculation, include = FALSE}
+
+coef_8 <- sr_78_rank %>%
+  ungroup() %>%
+  filter(!quant %in% c(0, 1)) %>%
+  group_by(band)  %>%
+  nest() %>%
+  mutate( model = purrr::map(data, ~lm(value_7 ~ poly(value_8, 2, raw=T), data = .) %>%
+                               tidy %>%
+                               dplyr::select(term, estimate) %>%
+                               spread(term, estimate))) %>%
+  unnest(model) %>%
+  dplyr::select(-data) %>%
+  rename(band= 1, intercept=2, coef1=3, coef2=4 )  %>%
+  mutate(sat = "LC08") %>%
+  mutate(fit = "98_quant")
+
+# Create a dataframe with arbitrary correction coefficients for LS07
+coef_7 <- tibble(band = c("Blue", "Red", "Green", "Nir", "Swir1", "Swir2"), intercept = 0, coef1=1, coef2=0, sat= "LE07")
+
+# Create a copy of the 'coef_8' table for LS09
+coef_9 <- coef_8 %>% #Landsat 9 sensor is virtually the same as LS 8 , so we are assuming the coefficients should be the same 
+mutate(sat = "LC09")
+
+# Combine all coef-dataframes into one
+corr_coef <- bind_rows(coef_5, coef_7, coef_8, coef_9) %>%
+  ungroup()
+
+# Save the correlation coefficients dataframe and the clean SR-data as a feather file,
+# because this filetype is more suitable for fast pushing and pulling dataframes in and out of memory.
+# ON DESKTOP
+# write_feather(corr_coef, "C:/Users/6569757/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/LC02_Corr_Coef.feather")
+# # Also save this fil as .csv file:
+# write.csv(corr_coef, "C:/Users/6569757/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/LC02_Corr_Coef.csv", row.names = TRUE)
+# write_feather(sr_clean, "C:/Users/6569757/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/LC02_SR_Clean.feather")
+
+# ON LAPTOP
+write_feather(corr_coef, "C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/LC02_Corr_Coef.feather")
+# Also save this fil as .csv file:
+write.csv(corr_coef, "C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/LC02_Corr_Coef.csv", row.names = TRUE)
+write_feather(sr_clean, "C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/LC02_SR_Clean.feather")
+
+```
