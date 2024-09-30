@@ -1,0 +1,129 @@
+---
+title: "RMD_SSC_Build_Matchups"
+author: "Beau van Koert"
+date: "2024-05-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages 
+```{r package import, include = FALSE, echo = FALSE}
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(ggplot2)
+library(broom)
+
+# Remove scientific notation for the rest of the script
+options(scipen = 999)
+
+```
+
+## Import data files
+
+```{r Import data, echo=FALSE}
+# Import Lobith SSC data
+# ssc_lobptn <- read.csv("C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/SSC_data/ZS_CONCTTE_LOBPTN.csv", row.names = NULL, sep = ";")
+
+# Import all SSC data from WaterInfo (RWS)
+ssc_rws_raw <- read.csv("C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/SSC_data/Stations_onopgeloste_stoffen/ALL_STATIONS_onop_stof.csv", row.names = NULL, sep = ";")
+# replace the commas in the ssc-value column with dots
+ssc_rws_raw$NUMERIEKEWAARDE <- gsub("," , ".", ssc_rws_raw$NUMERIEKEWAARDE)
+
+# Import in-situ SR data
+sr_insitu_final <- read.csv("C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/Model_Data/LC02_matchup_1DAY.csv", row.names = NULL, sep = ",", stringsAsFactors = F)
+```
+
+# Clean up the data
+
+``` {r Clean up the data, echo=FALSE}
+# Add Site_ID based on LOCATIE_CODE
+ssc_rws_SiteID <- ssc_rws_raw %>%
+  mutate(Site_ID = case_when(
+    str_detect(LOCATIE_CODE, "AMRGBVN") ~ 33,
+    str_detect(LOCATIE_CODE, "AMRGBVN") ~ 33,
+    str_detect(LOCATIE_CODE, "BOVSS") ~ 6,
+    str_detect(LOCATIE_CODE, "BRAKL") ~ 26,
+    str_detect(LOCATIE_CODE, "BRIENOD") ~ 17,
+    str_detect(LOCATIE_CODE, "DRIELBVN") ~ 32,
+    str_detect(LOCATIE_CODE, "GOUDRK") ~ 19,
+    str_detect(LOCATIE_CODE, "GOUDVHVN") ~ 20,
+    str_detect(LOCATIE_CODE, "GRAVBVN") ~ 29,
+    str_detect(LOCATIE_CODE, "HAGSN") ~ 34,
+    str_detect(LOCATIE_CODE, "HANK") ~ 23,
+    str_detect(LOCATIE_CODE, "HARDVD") ~ 22,
+    str_detect(LOCATIE_CODE, "HARVBG") ~ 5,
+    str_detect(LOCATIE_CODE, "HARVSS") ~ 1,
+    str_detect(LOCATIE_CODE, "HEDL") ~ 27,
+    str_detect(LOCATIE_CODE, "HOEKVHBSD") ~ 16,
+    str_detect(LOCATIE_CODE, "HOEKVHLD") ~ 15,
+    str_detect(LOCATIE_CODE, "KEIZVR") ~ 24,
+    str_detect(LOCATIE_CODE, "KLUNDT") ~ 7,
+    str_detect(LOCATIE_CODE, "LITHBVN") ~ 28,
+    str_detect(LOCATIE_CODE, "LOBPTN") ~ 31,
+    str_detect(LOCATIE_CODE, "MAASSS") ~ 13,
+    str_detect(LOCATIE_CODE, "MIDDHNS") ~ 3,
+    str_detect(LOCATIE_CODE, "MOERDBGN") ~ 8,
+    str_detect(LOCATIE_CODE, "OUDBELD") ~ 12,
+    str_detect(LOCATIE_CODE, "PAPDT") ~ 21,
+    str_detect(LOCATIE_CODE, "PUTTHK") ~ 11,
+    str_detect(LOCATIE_CODE, "SAMBBVN") ~ 30,
+    str_detect(LOCATIE_CODE, "SCHEELHK") ~ 2,
+    str_detect(LOCATIE_CODE, "SCHENKDK") ~ 9,
+    str_detect(LOCATIE_CODE, "SLIKKVR") ~ 18,
+    str_detect(LOCATIE_CODE, "STADAHHRVTDP") ~ 4,
+    str_detect(LOCATIE_CODE, "SUURHBG") ~ 14,
+    str_detect(LOCATIE_CODE, "VURN") ~ 25,
+    str_detect(LOCATIE_CODE, "ZUIDHVN") ~ 10
+  ))
+
+ssc_rws_clean <- ssc_rws_SiteID %>%
+  # Select usefull columns
+  dplyr::select(MEETPUNT_IDENTIFICATIE, Site_ID, LOCATIE_CODE, EENHEID_CODE, WAARNEMINGDATUM, WAARNEMINGTIJD..MET.CET., ALFANUMERIEKEWAARDE, EPSG, X, Y)
+
+ssc_rws_clean <- ssc_rws_clean %>%
+  # Rename the columns
+  rename(
+    loc_name = 'MEETPUNT_IDENTIFICATIE',
+    loc_code = 'LOCATIE_CODE',
+    unit = 'EENHEID_CODE',
+    date = 'WAARNEMINGDATUM',
+    time = 'WAARNEMINGTIJD..MET.CET.',
+    ssc = 'ALFANUMERIEKEWAARDE',
+  )
+
+ssc_rws_clean <- ssc_rws_clean %>%
+  # relocate(loc_code, .after = loc_name) %>%
+  # relocate(unit, .after = time) %>%
+  # Filter on ssc values between 0.1 and 2000 mg/L
+  dplyr::filter(ssc >= 0,
+                ssc < 2000)
+
+# change date from "%d-%m-%Y"  "%m/%d/%Y", but still as characters
+ssc_rws_clean$date <- format.Date(as.POSIXct(strptime(as.character(ssc_rws_clean$date), "%d-%m-%Y")), "%d/%m/%Y")
+# ssc_rws_clean$date <- gsub("-", "/", ssc_rws_clean$date)
+
+```
+
+# Merge SSC data with SR data
+
+``` {r Merge ssc data with SR data}
+# change date format of sr_insitu_final to same format as ssc_rws_clean
+sr_insitu_final$date <- format.Date(as.POSIXct(strptime(as.character(sr_insitu_final$date), "%Y-%m-%d")), "%d/%m/%Y")
+
+# inner join the ssc data to the SR data
+sr_plus_ssc_inner <- inner_join(sr_insitu_final, ssc_rws_clean,  by = c('Site_ID', 'date'), multiple = "any", relationship = "many-to-many")
+# 'multiple'="any" to prevent duplicate rows
+
+```
+
+# Save final file
+``` {r Save data as csv}
+# Save sr_plus_ssc_inner as csv
+write.csv(sr_plus_ssc_inner, "C:/Users/beauv/OneDrive - Universiteit Utrecht/1.Aardwetenschappen/Master - Earth Surface & Water/Jaar 2/MSc Thesis/RMD_SSC_model/LC02_matchup_pull/Model_Data/RMD_sr_plus_ssc_1DAY.csv", row.names = FALSE)
+
+
+```
